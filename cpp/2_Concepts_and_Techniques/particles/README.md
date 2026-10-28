@@ -36,3 +36,27 @@ Make sure the dependencies mentioned in [Dependencies]() section above are insta
 ## References (for more details)
 
 [whitepaper](./doc/particles.pdf)
+
+## Benchmark options (project extensions)
+
+Headless runs use `-benchmark`; the options below are added on top of the original `-n`, `-grid`, `-i`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-mode=<name>` | `base` | collision kernel variant (`base` = original sync-free gather kernel) |
+| `-block=<k>` | `64` | threads per block of the collision kernel (multiple of 32) |
+| `-warmup=<k>` | `10` | warm-up steps; the system is then reset to the same initial state |
+| `-dump=<file>` | | write the final positions (float4 per particle) |
+| `-compare=<file>` | | compare the final positions with a dump, exit code 1 if any particle differs more than `-tol` |
+| `-tol=<x>` | `1e-3` | per-component position tolerance for `-compare` |
+
+Each run prints the mean GPU time of every phase (integrate, hash, sort, reorder, collide), measured with
+CUDA events without synchronizing inside the loop, and a `CSV,...` line to collect results with `grep "^CSV"`.
+
+Example: validate a variant against the baseline (use few iterations: the system is chaotic and float
+differences grow over time).
+
+```
+particles -benchmark -n=65536 -i=50 -dump=base.bin
+particles -benchmark -n=65536 -i=50 -mode=<variant> -compare=base.bin
+```

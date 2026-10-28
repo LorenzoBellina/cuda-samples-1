@@ -65,7 +65,9 @@ extern "C"
                  uint  *cellStart,
                  uint  *cellEnd,
                  uint   numParticles,
-                 uint   numCells);
+                 uint   numCells,
+                 int    mode,
+                 uint   blockSize);
 
     void sortParticles(uint *dGridParticleHash, uint *dGridParticleIndex, uint numParticles);
 }

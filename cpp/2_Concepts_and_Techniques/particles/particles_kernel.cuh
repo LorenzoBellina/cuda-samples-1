@@ -31,6 +31,9 @@
 #include "vector_types.h"
 typedef unsigned int uint;
 
+// collision kernel variants, selected on the command line with -mode=<name>
+enum CollideMode { COLLIDE_BASE = 0, NUM_COLLIDE_MODES };
+
 // simulation parameters
 struct SimParams
 {

@@ -50,6 +50,11 @@ public:
         VELOCITY,
     };
 
+    // phases of one simulation step, timed separately with CUDA events
+    enum Phase { PHASE_INTEGRATE, PHASE_HASH, PHASE_SORT, PHASE_REORDER, PHASE_COLLIDE, NUM_PHASES };
+
+    static const char *getPhaseName(int phase);
+
     void update(float deltaTime);
     void reset(ParticleConfig config);
 
@@ -78,6 +83,17 @@ public:
     void setCollideAttraction(float x) { m_params.attraction = x; }
 
     void setColliderPos(float3 x) { m_params.colliderPos = x; }
+
+    void        setCollideMode(CollideMode m) { m_collideMode = m; }
+    CollideMode getCollideMode() const { return m_collideMode; }
+    void        setCollideBlockSize(uint b) { m_collideBlockSize = b; }
+    uint        getCollideBlockSize() const { return m_collideBlockSize; }
+
+    // record per-phase CUDA events for the next maxFrames calls to update()
+    void startPhaseTiming(int maxFrames);
+    // wait for the recorded events, sum the time of each phase over the timed
+    // frames into phaseMs[NUM_PHASES] and return the number of timed frames
+    int stopPhaseTiming(float *phaseMs);
 
     float  getParticleRadius() { return m_params.particleRadius; }
     float3 getColliderPos() { return m_params.colliderPos; }
@@ -141,6 +157,16 @@ protected: // data
     StopWatchInterface *m_timer;
 
     uint m_solverIterations;
+
+    CollideMode m_collideMode;
+    uint        m_collideBlockSize;
+
+    // NUM_PHASES + 1 events per timed frame (cudaEvent_t == CUevent_st *)
+    struct CUevent_st **m_phaseEvents;
+    int                 m_maxTimedFrames;
+    int                 m_timedFrames;
+
+    void recordPhaseEvent(int slot);
 };
 
 #endif // __PARTICLESYSTEM_H__

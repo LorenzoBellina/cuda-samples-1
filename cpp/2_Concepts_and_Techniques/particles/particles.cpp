@@ -60,6 +60,7 @@
 
 // Includes
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdlib.h>
@@ -135,6 +136,15 @@ unsigned int frameCount       = 0;
 unsigned int g_TotalErrors    = 0;
 char        *g_refFile        = NULL;
 
+// Experiment options (benchmark mode)
+const char *collideModeNames[NUM_COLLIDE_MODES] = {"base"};
+CollideMode collideMode                         = COLLIDE_BASE;
+uint        collideBlockSize                    = 64;
+int         warmupIterations                    = 10;
+char       *g_dumpFile                          = NULL; // write final positions here
+char       *g_compareFile                       = NULL; // compare final positions with this file
+float       compareTolerance                    = 1.0e-3f;
+
 const char *sSDKsample = "CUDA Particles Simulation";
 
 extern "C" void cudaInit(int argc, char **argv);
@@ -194,10 +204,77 @@ void initGL(int *argc, char **argv)
     glutReportErrors();
 }
 
+// compare the final positions with a dump of another run (e.g. -mode=base);
+// float results differ slightly between variants, so a tolerance is used
+bool comparePositions(const float *hPos, uint n, const char *file, float tol)
+{
+    FILE *fp = fopen(file, "rb");
+
+    if (!fp) {
+        printf("compare: cannot open %s\n", file);
+        return false;
+    }
+
+    float *ref  = (float *)malloc(sizeof(float) * 4 * n);
+    size_t read = fread(ref, sizeof(float) * 4, n, fp);
+    bool   eof  = fgetc(fp) == EOF;
+    fclose(fp);
+
+    if (read != n || !eof) {
+        printf("compare: %s does not hold %u particles\n", file, n);
+        free(ref);
+        return false;
+    }
+
+    double maxErr = 0.0, sumSq = 0.0;
+    uint   numBad = 0;
+
+    for (uint i = 0; i < n; i++) {
+        float err = 0.0f;
+
+        for (int c = 0; c < 3; c++) {
+            err = std::max(err, fabsf(hPos[i * 4 + c] - ref[i * 4 + c]));
+        }
+
+        maxErr = std::max(maxErr, (double)err);
+        sumSq += (double)err * err;
+
+        if (!(err <= tol)) { // also catches NaN
+            numBad++;
+        }
+    }
+
+    free(ref);
+    printf("compare: max |dpos| = %.3e, rms = %.3e, particles over tol %.1e = %u / %u -> %s\n",
+           maxErr,
+           sqrt(sumSq / n),
+           tol,
+           numBad,
+           n,
+           numBad == 0 ? "PASSED" : "FAILED");
+    return numBad == 0;
+}
+
 void runBenchmark(int iterations, char *exec_path)
 {
-    printf("Run %u particles simulation for %d iterations...\n\n", numParticles, iterations);
+    // warm up (JIT, caches, clocks), then restart from the same initial state so
+    // the measured run and the final positions do not depend on the warm-up
+    if (warmupIterations > 0) {
+        for (int i = 0; i < warmupIterations; ++i) {
+            psystem->update(timestep);
+        }
+
+        psystem->reset(ParticleSystem::CONFIG_GRID);
+    }
+
+    printf("Run %u particles simulation for %d iterations (mode = %s, collide block = %u, warm-up = %d)...\n\n",
+           numParticles,
+           iterations,
+           collideModeNames[collideMode],
+           collideBlockSize,
+           warmupIterations);
     cudaDeviceSynchronize();
+    psystem->startPhaseTiming(iterations);
     sdkStartTimer(&timer);
 
     for (int i = 0; i < iterations; ++i) {
@@ -208,6 +285,14 @@ void runBenchmark(int iterations, char *exec_path)
     sdkStopTimer(&timer);
     float fAvgSeconds = ((float)1.0e-3 * (float)sdkGetTimerValue(&timer) / (float)iterations);
 
+    float phaseMs[ParticleSystem::NUM_PHASES];
+    int   timedFrames = psystem->stopPhaseTiming(phaseMs);
+    float gpuMs       = 0.0f;
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        gpuMs += phaseMs[p];
+    }
+
     printf("particles, Throughput = %.4f KParticles/s, Time = %.5f s, Size = %u "
            "particles, NumDevsUsed = %u, Workgroup = %u\n",
            (1.0e-3 * numParticles) / fAvgSeconds,
@@ -215,6 +300,53 @@ void runBenchmark(int iterations, char *exec_path)
            numParticles,
            1,
            0);
+
+    printf("\nPer-phase GPU time (cudaEvent, mean over %d frames):\n", timedFrames);
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        printf("  %-10s %9.4f ms  %5.1f %%\n",
+               ParticleSystem::getPhaseName(p),
+               phaseMs[p] / timedFrames,
+               100.0f * phaseMs[p] / gpuMs);
+    }
+
+    printf("  %-10s %9.4f ms\n\n", "frame", gpuMs / timedFrames);
+
+    // one line per run, to collect experiments with grep "^CSV"
+    printf("CSV_HEADER,mode,n,grid,block,iters,wall_ms");
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        printf(",%s_ms", ParticleSystem::getPhaseName(p));
+    }
+
+    printf("\nCSV,%s,%u,%u,%u,%d,%.5f",
+           collideModeNames[collideMode],
+           numParticles,
+           gridSize.x,
+           collideBlockSize,
+           iterations,
+           1.0e3f * fAvgSeconds);
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        printf(",%.5f", phaseMs[p] / timedFrames);
+    }
+
+    printf("\n");
+
+    if (g_dumpFile || g_compareFile) {
+        float *hPos = (float *)malloc(sizeof(float) * 4 * numParticles);
+        copyArrayFromDevice(hPos, psystem->getCudaPosVBO(), 0, sizeof(float) * 4 * numParticles);
+
+        if (g_dumpFile) {
+            sdkDumpBin((void *)hPos, sizeof(float) * 4 * numParticles, g_dumpFile);
+        }
+
+        if (g_compareFile && !comparePositions(hPos, numParticles, g_compareFile, compareTolerance)) {
+            g_TotalErrors++;
+        }
+
+        free(hPos);
+    }
 
     if (g_refFile) {
         printf("\nChecking result...\n\n");
@@ -700,6 +832,54 @@ int main(int argc, char **argv)
         numIterations = getCmdLineArgumentInt(argc, (const char **)argv, "i");
     }
 
+    if (checkCmdLineFlag(argc, (const char **)argv, "mode")) {
+        char *name = NULL;
+        getCmdLineArgumentString(argc, (const char **)argv, "mode", &name);
+        int m = 0;
+
+        while (m < NUM_COLLIDE_MODES && STRCASECMP(name, collideModeNames[m]) != 0) {
+            m++;
+        }
+
+        if (m == NUM_COLLIDE_MODES) {
+            printf("Unknown -mode=%s, valid modes:", name);
+
+            for (int i = 0; i < NUM_COLLIDE_MODES; i++) {
+                printf(" %s", collideModeNames[i]);
+            }
+
+            printf("\n");
+            exit(EXIT_FAILURE);
+        }
+
+        collideMode = (CollideMode)m;
+    }
+
+    if (checkCmdLineFlag(argc, (const char **)argv, "block")) {
+        collideBlockSize = getCmdLineArgumentInt(argc, (const char **)argv, "block");
+
+        if (collideBlockSize == 0 || collideBlockSize % 32 != 0 || collideBlockSize > 1024) {
+            printf("-block must be a multiple of 32 in [32, 1024]\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (checkCmdLineFlag(argc, (const char **)argv, "warmup")) {
+        warmupIterations = getCmdLineArgumentInt(argc, (const char **)argv, "warmup");
+    }
+
+    if (checkCmdLineFlag(argc, (const char **)argv, "dump")) {
+        getCmdLineArgumentString(argc, (const char **)argv, "dump", &g_dumpFile);
+    }
+
+    if (checkCmdLineFlag(argc, (const char **)argv, "compare")) {
+        getCmdLineArgumentString(argc, (const char **)argv, "compare", &g_compareFile);
+    }
+
+    if (checkCmdLineFlag(argc, (const char **)argv, "tol")) {
+        compareTolerance = getCmdLineArgumentFloat(argc, (const char **)argv, "tol");
+    }
+
     if (benchmark || g_refFile) {
         cudaInit(argc, argv);
     }
@@ -718,6 +898,8 @@ int main(int argc, char **argv)
     }
 
     initParticleSystem(numParticles, gridSize, !benchmark && g_refFile == NULL);
+    psystem->setCollideMode(collideMode);
+    psystem->setCollideBlockSize(collideBlockSize);
     initParams();
 
     if (benchmark || g_refFile) {

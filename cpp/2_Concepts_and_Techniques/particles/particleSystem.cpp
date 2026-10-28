@@ -42,6 +42,11 @@ ParticleSystem::ParticleSystem(uint numParticles, uint3 gridSize, bool bUseOpenG
     , m_gridSize(gridSize)
     , m_timer(NULL)
     , m_solverIterations(1)
+    , m_collideMode(COLLIDE_BASE)
+    , m_collideBlockSize(64)
+    , m_phaseEvents(NULL)
+    , m_maxTimedFrames(0)
+    , m_timedFrames(0)
 {
     m_numGridCells = m_gridSize.x * m_gridSize.y * m_gridSize.z;
     //    float3 worldSize = make_float3(2.0f, 2.0f, 2.0f);
@@ -268,14 +273,22 @@ void ParticleSystem::update(float deltaTime)
     // update constants
     setParameters(&m_params);
 
+    recordPhaseEvent(PHASE_INTEGRATE);
+
     // integrate
     integrateSystem(dPos, m_dVel, deltaTime, m_numParticles);
+
+    recordPhaseEvent(PHASE_HASH);
 
     // calculate grid hash
     calcHash(m_dGridParticleHash, m_dGridParticleIndex, dPos, m_numParticles);
 
+    recordPhaseEvent(PHASE_SORT);
+
     // sort particles based on hash
     sortParticles(m_dGridParticleHash, m_dGridParticleIndex, m_numParticles);
+
+    recordPhaseEvent(PHASE_REORDER);
 
     // reorder particle arrays into sorted order and
     // find start and end of each cell
@@ -290,6 +303,8 @@ void ParticleSystem::update(float deltaTime)
                                 m_numParticles,
                                 m_numGridCells);
 
+    recordPhaseEvent(PHASE_COLLIDE);
+
     // process collisions
     collide(m_dVel,
             m_dSortedPos,
@@ -298,12 +313,82 @@ void ParticleSystem::update(float deltaTime)
             m_dCellStart,
             m_dCellEnd,
             m_numParticles,
-            m_numGridCells);
+            m_numGridCells,
+            m_collideMode,
+            m_collideBlockSize);
+
+    recordPhaseEvent(NUM_PHASES);
+
+    if (m_timedFrames < m_maxTimedFrames) {
+        m_timedFrames++;
+    }
 
     // note: do unmap at end here to avoid unnecessary graphics/CUDA context switch
     if (m_bUseOpenGL) {
         unmapGLBufferObject(m_cuda_posvbo_resource);
     }
+}
+
+const char *ParticleSystem::getPhaseName(int phase)
+{
+    static const char *names[NUM_PHASES] = {"integrate", "hash", "sort", "reorder", "collide"};
+    return (phase >= 0 && phase < NUM_PHASES) ? names[phase] : "?";
+}
+
+// events of all timed frames are kept, so update() never waits on the device:
+// timing does not change the host/device overlap of the measured loop
+void ParticleSystem::startPhaseTiming(int maxFrames)
+{
+    assert(m_phaseEvents == NULL);
+
+    m_maxTimedFrames = maxFrames;
+    m_timedFrames    = 0;
+    m_phaseEvents    = new cudaEvent_t[maxFrames * (NUM_PHASES + 1)];
+
+    for (int i = 0; i < maxFrames * (NUM_PHASES + 1); i++) {
+        checkCudaErrors(cudaEventCreate(&m_phaseEvents[i]));
+    }
+}
+
+void ParticleSystem::recordPhaseEvent(int slot)
+{
+    if (m_timedFrames < m_maxTimedFrames) {
+        checkCudaErrors(cudaEventRecord(m_phaseEvents[m_timedFrames * (NUM_PHASES + 1) + slot]));
+    }
+}
+
+int ParticleSystem::stopPhaseTiming(float *phaseMs)
+{
+    int frames = m_timedFrames;
+
+    for (int p = 0; p < NUM_PHASES; p++) {
+        phaseMs[p] = 0.0f;
+    }
+
+    if (frames > 0) {
+        checkCudaErrors(cudaEventSynchronize(m_phaseEvents[frames * (NUM_PHASES + 1) - 1]));
+    }
+
+    for (int f = 0; f < frames; f++) {
+        cudaEvent_t *ev = &m_phaseEvents[f * (NUM_PHASES + 1)];
+
+        for (int p = 0; p < NUM_PHASES; p++) {
+            float ms;
+            checkCudaErrors(cudaEventElapsedTime(&ms, ev[p], ev[p + 1]));
+            phaseMs[p] += ms;
+        }
+    }
+
+    for (int i = 0; i < m_maxTimedFrames * (NUM_PHASES + 1); i++) {
+        checkCudaErrors(cudaEventDestroy(m_phaseEvents[i]));
+    }
+
+    delete[] m_phaseEvents;
+    m_phaseEvents    = NULL;
+    m_maxTimedFrames = 0;
+    m_timedFrames    = 0;
+
+    return frames;
 }
 
 void ParticleSystem::dumpGrid()

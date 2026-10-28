@@ -189,20 +189,27 @@ extern "C"
                  uint  *cellStart,
                  uint  *cellEnd,
                  uint   numParticles,
-                 uint   numCells)
+                 uint   numCells,
+                 int    mode,
+                 uint   blockSize)
     {
         // thread per particle
         uint numThreads, numBlocks;
-        computeGridSize(numParticles, 64, numBlocks, numThreads);
+        computeGridSize(numParticles, blockSize, numBlocks, numThreads);
 
-        // execute the kernel
-        collideD<<<numBlocks, numThreads>>>((float4 *)newVel,
-                                            (float4 *)sortedPos,
-                                            (float4 *)sortedVel,
-                                            gridParticleIndex,
-                                            cellStart,
-                                            cellEnd,
-                                            numParticles);
+        // execute the kernel variant selected by mode
+        switch (mode) {
+        default:
+        case COLLIDE_BASE:
+            collideD<<<numBlocks, numThreads>>>((float4 *)newVel,
+                                                (float4 *)sortedPos,
+                                                (float4 *)sortedVel,
+                                                gridParticleIndex,
+                                                cellStart,
+                                                cellEnd,
+                                                numParticles);
+            break;
+        }
 
         // check if kernel invocation generated an error
         getLastCudaError("Kernel execution failed");
