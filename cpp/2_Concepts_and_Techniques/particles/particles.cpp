@@ -67,7 +67,10 @@
 
 #include "paramgl.h"
 #include "particleSystem.h"
+#include "particleSystem_omp.h"
 #include "render_particles.h"
+
+#include <omp.h>
 
 #define MAX_EPSILON_ERROR 5.00f
 #define THRESHOLD         0.30f
@@ -144,6 +147,10 @@ int         warmupIterations                    = 10;
 char       *g_dumpFile                          = NULL; // write final positions here
 char       *g_compareFile                       = NULL; // compare final positions with this file
 float       compareTolerance                    = 1.0e-3f;
+
+// CPU backend (Step 1): -backend=omp -threads=<k> -schedule=<kind>[:<chunk>]
+bool useOmp              = false;
+char ompScheduleName[64] = "static";
 
 const char *sSDKsample = "CUDA Particles Simulation";
 
@@ -255,8 +262,136 @@ bool comparePositions(const float *hPos, uint n, const char *file, float tol)
     return numBad == 0;
 }
 
+// print the timing of a run: human readable table and one CSV line per run, to
+// collect experiments with grep "^CSV"
+void printReport(const char  *backend,
+                 int          threads,
+                 const char  *schedule,
+                 int          iterations,
+                 float        avgSeconds,
+                 const float *phaseMs,
+                 int          timedFrames,
+                 const char  *timerName)
+{
+    float frameMs = 0.0f;
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        frameMs += phaseMs[p];
+    }
+
+    printf("particles, Throughput = %.4f KParticles/s, Time = %.5f s, Size = %u "
+           "particles, NumDevsUsed = %u, Workgroup = %u\n",
+           (1.0e-3 * numParticles) / avgSeconds,
+           avgSeconds,
+           numParticles,
+           1,
+           0);
+
+    printf("\nPer-phase time (%s, mean over %d frames):\n", timerName, timedFrames);
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        printf("  %-10s %9.4f ms  %5.1f %%\n",
+               ParticleSystem::getPhaseName(p),
+               phaseMs[p] / timedFrames,
+               100.0f * phaseMs[p] / frameMs);
+    }
+
+    printf("  %-10s %9.4f ms\n\n", "frame", frameMs / timedFrames);
+
+    printf("CSV_HEADER,backend,mode,n,grid,block,threads,schedule,iters,wall_ms");
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        printf(",%s_ms", ParticleSystem::getPhaseName(p));
+    }
+
+    printf("\nCSV,%s,%s,%u,%u,%u,%d,%s,%d,%.5f",
+           backend,
+           collideModeNames[collideMode],
+           numParticles,
+           gridSize.x,
+           strcmp(backend, "gpu") == 0 ? collideBlockSize : 0,
+           threads,
+           schedule,
+           iterations,
+           1.0e3f * avgSeconds);
+
+    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
+        printf(",%.5f", phaseMs[p] / timedFrames);
+    }
+
+    printf("\n");
+}
+
+// -dump / -compare on the final positions (float4 per particle)
+void dumpAndComparePositions(const float *hPos)
+{
+    if (g_dumpFile) {
+        sdkDumpBin((void *)hPos, sizeof(float) * 4 * numParticles, g_dumpFile);
+    }
+
+    if (g_compareFile && !comparePositions(hPos, numParticles, g_compareFile, compareTolerance)) {
+        g_TotalErrors++;
+    }
+}
+
+// CPU (OpenMP) run of the same simulation, started from the same initial state
+// prepared by ParticleSystem::reset() (Step 1)
+void runBenchmarkOmp(int iterations)
+{
+    ParticleSystemOmp ompSystem(numParticles, psystem->getParams());
+
+    ompSystem.setState(psystem->getHostArray(ParticleSystem::POSITION),
+                       psystem->getHostArray(ParticleSystem::VELOCITY));
+
+    // warm up (thread pool creation, caches, page faults of the arrays), then restart
+    if (warmupIterations > 0) {
+        for (int i = 0; i < warmupIterations; ++i) {
+            ompSystem.update(timestep);
+        }
+
+        ompSystem.setState(psystem->getHostArray(ParticleSystem::POSITION),
+                           psystem->getHostArray(ParticleSystem::VELOCITY));
+    }
+
+    printf("Run %u particles simulation for %d iterations on CPU (OpenMP: %d threads, %d procs, "
+           "collide schedule = %s, warm-up = %d)...\n\n",
+           numParticles,
+           iterations,
+           omp_get_max_threads(),
+           omp_get_num_procs(),
+           ompScheduleName,
+           warmupIterations);
+
+    ompSystem.resetPhaseTiming();
+    double start = omp_get_wtime();
+
+    for (int i = 0; i < iterations; ++i) {
+        ompSystem.update(timestep);
+    }
+
+    float avgSeconds = (float)((omp_get_wtime() - start) / iterations);
+
+    float phaseMs[ParticleSystem::NUM_PHASES];
+    int   timedFrames = ompSystem.getPhaseTiming(phaseMs);
+
+    printReport("omp",
+                omp_get_max_threads(),
+                ompScheduleName,
+                iterations,
+                avgSeconds,
+                phaseMs,
+                timedFrames,
+                "omp_get_wtime");
+    dumpAndComparePositions(ompSystem.getPos());
+}
+
 void runBenchmark(int iterations, char *exec_path)
 {
+    if (useOmp) {
+        runBenchmarkOmp(iterations);
+        return;
+    }
+
     // warm up (JIT, caches, clocks), then restart from the same initial state so
     // the measured run and the final positions do not depend on the warm-up
     if (warmupIterations > 0) {
@@ -287,64 +422,13 @@ void runBenchmark(int iterations, char *exec_path)
 
     float phaseMs[ParticleSystem::NUM_PHASES];
     int   timedFrames = psystem->stopPhaseTiming(phaseMs);
-    float gpuMs       = 0.0f;
 
-    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
-        gpuMs += phaseMs[p];
-    }
-
-    printf("particles, Throughput = %.4f KParticles/s, Time = %.5f s, Size = %u "
-           "particles, NumDevsUsed = %u, Workgroup = %u\n",
-           (1.0e-3 * numParticles) / fAvgSeconds,
-           fAvgSeconds,
-           numParticles,
-           1,
-           0);
-
-    printf("\nPer-phase GPU time (cudaEvent, mean over %d frames):\n", timedFrames);
-
-    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
-        printf("  %-10s %9.4f ms  %5.1f %%\n",
-               ParticleSystem::getPhaseName(p),
-               phaseMs[p] / timedFrames,
-               100.0f * phaseMs[p] / gpuMs);
-    }
-
-    printf("  %-10s %9.4f ms\n\n", "frame", gpuMs / timedFrames);
-
-    // one line per run, to collect experiments with grep "^CSV"
-    printf("CSV_HEADER,mode,n,grid,block,iters,wall_ms");
-
-    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
-        printf(",%s_ms", ParticleSystem::getPhaseName(p));
-    }
-
-    printf("\nCSV,%s,%u,%u,%u,%d,%.5f",
-           collideModeNames[collideMode],
-           numParticles,
-           gridSize.x,
-           collideBlockSize,
-           iterations,
-           1.0e3f * fAvgSeconds);
-
-    for (int p = 0; p < ParticleSystem::NUM_PHASES; p++) {
-        printf(",%.5f", phaseMs[p] / timedFrames);
-    }
-
-    printf("\n");
+    printReport("gpu", 0, "-", iterations, fAvgSeconds, phaseMs, timedFrames, "cudaEvent");
 
     if (g_dumpFile || g_compareFile) {
         float *hPos = (float *)malloc(sizeof(float) * 4 * numParticles);
         copyArrayFromDevice(hPos, psystem->getCudaPosVBO(), 0, sizeof(float) * 4 * numParticles);
-
-        if (g_dumpFile) {
-            sdkDumpBin((void *)hPos, sizeof(float) * 4 * numParticles, g_dumpFile);
-        }
-
-        if (g_compareFile && !comparePositions(hPos, numParticles, g_compareFile, compareTolerance)) {
-            g_TotalErrors++;
-        }
-
+        dumpAndComparePositions(hPos);
         free(hPos);
     }
 
@@ -878,6 +962,70 @@ int main(int argc, char **argv)
 
     if (checkCmdLineFlag(argc, (const char **)argv, "tol")) {
         compareTolerance = getCmdLineArgumentFloat(argc, (const char **)argv, "tol");
+    }
+
+    if (checkCmdLineFlag(argc, (const char **)argv, "backend")) {
+        char *name = NULL;
+        getCmdLineArgumentString(argc, (const char **)argv, "backend", &name);
+
+        if (STRCASECMP(name, "omp") == 0) {
+            useOmp = true;
+        }
+        else if (STRCASECMP(name, "gpu") != 0) {
+            printf("Unknown -backend=%s, valid backends: gpu omp\n", name);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // number of OpenMP threads, same as OMP_NUM_THREADS [Lez04 OpenMP]
+    if (checkCmdLineFlag(argc, (const char **)argv, "threads")) {
+        omp_set_num_threads(getCmdLineArgumentInt(argc, (const char **)argv, "threads"));
+    }
+
+    // schedule of the collide loop, which uses schedule(runtime): same as setting
+    // OMP_SCHEDULE="kind,chunk" [Lez04 OpenMP - Ripartire le iterazioni tra i thread];
+    // ':' is accepted in place of ',' so the value can go in a CSV column
+    {
+        char *value = NULL;
+
+        if (checkCmdLineFlag(argc, (const char **)argv, "schedule")) {
+            getCmdLineArgumentString(argc, (const char **)argv, "schedule", &value);
+        }
+
+        char kindName[32] = "static";
+        int  chunk        = 0; // 0 = runtime default chunk
+
+        if (value) {
+            if (sscanf(value, "%31[a-zA-Z]%*[,:]%d", kindName, &chunk) < 1) {
+                printf("Invalid -schedule=%s, use static|dynamic|guided[:chunk]\n", value);
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        omp_sched_t kind;
+
+        if (STRCASECMP(kindName, "static") == 0) {
+            kind = omp_sched_static;
+        }
+        else if (STRCASECMP(kindName, "dynamic") == 0) {
+            kind = omp_sched_dynamic;
+        }
+        else if (STRCASECMP(kindName, "guided") == 0) {
+            kind = omp_sched_guided;
+        }
+        else {
+            printf("Invalid -schedule=%s, use static|dynamic|guided[:chunk]\n", value);
+            exit(EXIT_FAILURE);
+        }
+
+        omp_set_schedule(kind, chunk);
+
+        if (chunk > 0) {
+            snprintf(ompScheduleName, sizeof(ompScheduleName), "%s:%d", kindName, chunk);
+        }
+        else {
+            snprintf(ompScheduleName, sizeof(ompScheduleName), "%s", kindName);
+        }
     }
 
     if (benchmark || g_refFile) {

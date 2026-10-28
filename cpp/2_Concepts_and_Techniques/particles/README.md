@@ -49,6 +49,9 @@ Headless runs use `-benchmark`; the options below are added on top of the origin
 | `-dump=<file>` | | write the final positions (float4 per particle) |
 | `-compare=<file>` | | compare the final positions with a dump, exit code 1 if any particle differs more than `-tol` |
 | `-tol=<x>` | `1e-3` | per-component position tolerance for `-compare` |
+| `-backend=<b>` | `gpu` | `gpu` (CUDA) or `omp` (CPU, OpenMP version of the same algorithm, `particleSystem_omp.cpp`) |
+| `-threads=<k>` | all cores | OpenMP threads (same as `OMP_NUM_THREADS`) |
+| `-schedule=<kind>[:<chunk>]` | `static` | OpenMP schedule of the collide loop (`static`, `dynamic`, `guided`), which uses `schedule(runtime)` |
 
 Each run prints the mean GPU time of every phase (integrate, hash, sort, reorder, collide), measured with
 CUDA events without synchronizing inside the loop, and a `CSV,...` line to collect results with `grep "^CSV"`.
@@ -60,3 +63,9 @@ differences grow over time).
 particles -benchmark -n=65536 -i=50 -dump=base.bin
 particles -benchmark -n=65536 -i=50 -mode=<variant> -compare=base.bin
 ```
+
+The OpenMP backend gives bit-identical results for any number of threads and schedule, and matches the GPU
+within rounding (max position difference ~1e-5 after 25 steps, ~1e-3 after 50 because of the chaotic dynamics).
+`scaling_omp.ps1` runs the strong and weak scaling series and writes them to a CSV file.
+On Windows the OpenMP backend is built with `/openmp:llvm` (OpenMP 3.x runtime, needed by `omp_set_schedule`);
+CMake copies `libomp140.x86_64.dll` next to the executable.

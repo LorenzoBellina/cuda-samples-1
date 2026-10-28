@@ -31,7 +31,7 @@ find_package(GLUT)
 
 if(${OpenGL_FOUND})
     if (${GLUT_FOUND})
-        add_executable(particles particleSystem.cpp particleSystem_cuda.cu particles.cpp render_particles.cpp shaders.cpp)
+        add_executable(particles particleSystem.cpp particleSystem_cuda.cu particleSystem_omp.cpp particles.cpp render_particles.cpp shaders.cpp)
         target_compile_options(particles PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
         target_compile_features(particles PRIVATE cxx_std_17 cuda_std_17)
         target_include_directories(particles PUBLIC
@@ -43,6 +43,24 @@ if(${OpenGL_FOUND})
             ${OPENGL_LIBRARIES}
             ${GLUT_LIBRARIES}
         )
+        # OpenMP CPU backend (-backend=omp). MSVC's default /openmp is OpenMP 2.0, which lacks
+        # omp_set_schedule() used for schedule(runtime): use the LLVM runtime instead.
+        if(MSVC)
+            target_compile_options(particles PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/openmp:llvm>)
+            get_filename_component(MSVC_VC_DIR "${CMAKE_CXX_COMPILER}/../../../../../../.." ABSOLUTE)
+            file(GLOB LIBOMP_DLL "${MSVC_VC_DIR}/Redist/MSVC/*/debug_nonredist/x64/Microsoft.VC*.OpenMP.LLVM/libomp140.x86_64.dll")
+            if(LIBOMP_DLL)
+                list(GET LIBOMP_DLL 0 LIBOMP_DLL)
+                add_custom_command(TARGET particles POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LIBOMP_DLL} $<TARGET_FILE_DIR:particles>
+                )
+            else()
+                message(WARNING "libomp140.x86_64.dll not found: copy it next to particles.exe")
+            endif()
+        else()
+            find_package(OpenMP REQUIRED)
+            target_link_libraries(particles OpenMP::OpenMP_CXX)
+        endif()
         # Copy the data directory to the output directory
         add_custom_command(TARGET particles POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_directory

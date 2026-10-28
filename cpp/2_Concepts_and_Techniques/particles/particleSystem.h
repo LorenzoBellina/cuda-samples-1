@@ -84,6 +84,10 @@ public:
 
     void setColliderPos(float3 x) { m_params.colliderPos = x; }
 
+    const SimParams &getParams() const { return m_params; }
+    // host copy of the state written by the last reset(), without reading back the device
+    const float *getHostArray(ParticleArray array) const { return array == POSITION ? m_hPos : m_hVel; }
+
     void        setCollideMode(CollideMode m) { m_collideMode = m; }
     CollideMode getCollideMode() const { return m_collideMode; }
     void        setCollideBlockSize(uint b) { m_collideBlockSize = b; }
